@@ -1,17 +1,25 @@
 package main
 
 import (
+	"encoding/json"
 	"encoding/xml"
 	"fmt"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	"github.com/wlredeye/jsonlines"
 	"golang.org/x/net/html/charset"
 )
 
+var input = "amedia_tv_series.xml"
 var output = "output.txt"
+var imdbToKPPath = "imdbToKP.json"
+var imdbToKP map[string]string
+var fileDBPath = "files.json"
+var files = []File{}
 
 type VideoData struct {
 	XMLName xml.Name    `xml:"video-data"`
@@ -132,8 +140,10 @@ type XMLVideo struct {
 type Series struct {
 	TitleOriginal   string
 	TitleTranslated string
+	KinopoiskID     string
 	Year            int
 	Restriction     string
+	Studio          string
 	Seasons         []Season
 }
 
@@ -145,13 +155,24 @@ type Season struct {
 }
 
 type Episode struct {
-	Number    int
-	File      string
-	Available string
+	Number          int
+	File            string
+	TitleOriginal   string
+	TitleTranslated string
+	Available       string
+}
+
+type File struct {
+	File            string
+	TitleOriginal   string
+	TitleTranslated string
+	KinopoiskID     string
+	Season          int
+	Number          int
 }
 
 func (s Series) String() string {
-	output := fmt.Sprintf("%v (%v) [%v %v]\n", s.TitleTranslated, s.TitleOriginal, s.Year, s.Restriction)
+	output := fmt.Sprintf("%v (%v) [%v %v %v %v]\n", s.TitleTranslated, s.TitleOriginal, s.KinopoiskID, s.Year, s.Restriction, s.Studio)
 	for _, s := range s.Seasons {
 		output += fmt.Sprintf("\t%v\n", s)
 	}
@@ -162,13 +183,31 @@ func (s Series) String() string {
 func (s Season) String() string {
 	output := fmt.Sprintf("s%02d %v\n", s.Number, s.Year)
 	for _, e := range s.Episodes {
-		output += fmt.Sprintf("\ts%02de%02d\t%v\t%v\n", s.Number, e.Number, e.File, e.Available)
+		output += fmt.Sprintf("\ts%02de%02d\t%v\t%v\t%v (%v)\n", s.Number, e.Number, e.File, e.Available, e.TitleTranslated, e.TitleOriginal)
 	}
 	return output
 }
 
 func main() {
-	f, err := os.Open("amedia_tv_series.xml")
+	if _, err := os.Stat(imdbToKPPath); err == nil {
+		file, err := os.Open(imdbToKPPath)
+		if err != nil {
+			panic(err)
+		}
+		defer file.Close()
+
+		data, err := ioutil.ReadAll(file)
+		if err != nil {
+			panic(err)
+		}
+
+		err = json.Unmarshal(data, &imdbToKP)
+		if err != nil {
+			panic(err)
+		}
+	}
+
+	f, err := os.Open(input)
 	if err != nil {
 		panic(err)
 	}
@@ -195,11 +234,38 @@ func main() {
 			panic(err)
 		}
 
+		kpID := strings.TrimSpace(xmlSerial.MetaInfo.KinopoiskID)
+		imdbID := strings.TrimSpace(xmlSerial.MetaInfo.ImdbID)
+
+		if kpID == "" && imdbID == "" {
+			if val, ok := imdbToKP[imdbID]; ok {
+				kpID = val
+			}
+		}
+
+		studio := ""
+
+		for _, c := range xmlSerial.MetaInfo.Credits.Credit {
+			if c.Role == "studio" {
+				studio = strings.TrimSpace(c.Text)
+			}
+
+			if studio == "" {
+				for _, c := range xmlSerial.MetaInfo.Credits.Credit {
+					if c.Role == "originabroadcaster" {
+						studio = strings.TrimSpace(c.Text)
+					}
+				}
+			}
+		}
+
 		serial := Series{
 			TitleOriginal:   strings.TrimSpace(xmlSerial.MetaInfo.Title[0].Text),
 			TitleTranslated: strings.TrimSpace(xmlSerial.MetaInfo.Title[1].Text),
+			KinopoiskID:     kpID,
 			Year:            year,
 			Restriction:     strings.TrimSpace(xmlSerial.MetaInfo.Restriction),
+			Studio:          studio,
 		}
 
 		for _, xmlSeason := range xmlSerial.Seasons {
@@ -224,18 +290,40 @@ func main() {
 				}
 
 				episode := Episode{
-					Number:    number,
-					File:      strings.TrimSpace(filepath.Base(xmlEpisode.Src)),
-					Available: strings.TrimSpace(xmlEpisode.MetaInfo.Available.Start),
+					Number:          number,
+					File:            strings.TrimSpace(filepath.Base(xmlEpisode.Src)),
+					TitleOriginal:   strings.TrimSpace(xmlEpisode.MetaInfo.Title[0].Text),
+					TitleTranslated: strings.TrimSpace(xmlEpisode.MetaInfo.Title[1].Text),
+					Available:       strings.TrimSpace(xmlEpisode.MetaInfo.Available.Start),
 				}
 
 				season.Episodes = append(season.Episodes, episode)
+
+				file := File{
+					File:            episode.File,
+					TitleOriginal:   serial.TitleOriginal,
+					TitleTranslated: serial.TitleTranslated,
+					KinopoiskID:     serial.KinopoiskID,
+					Season:          season.Number,
+					Number:          number,
+				}
+
+				fileDB, err := os.OpenFile(fileDBPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0755)
+				if err != nil {
+					panic(err)
+				}
+				defer fileDB.Close()
+
+				err = jsonlines.Encode(fileDB, &[]File{file})
+				if err != nil {
+					panic(err)
+				}
 			}
 
 			serial.Seasons = append(serial.Seasons, season)
 		}
 
-		s := fmt.Sprintf("%v\n", serial)
+		s := fmt.Sprintf("%v", serial)
 		fmt.Print(s)
 		writeStringToFile(output, s)
 	}
